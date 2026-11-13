@@ -1,0 +1,6 @@
+{
+  "name": "Palco Studio",
+  "description": "Web app per creare video karaoke con rimozione vocale, estrazione e sincronizzazione del testo, personalizzazione di font e sfondo, e anteprima in tempo reale.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
