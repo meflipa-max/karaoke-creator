@@ -11,7 +11,7 @@ import {
   ListMusic,
 } from 'lucide-react';
 import { KaraokeProject, LyricLine } from '../types/karaoke';
-import { connectVocalRemovalGraph } from '../utils/audioEngine';
+import { renderCleanKaraokeAudioBuffer } from '../utils/spectralVocalRemover';
 import { renderKaraokeFrame } from '../utils/karaokeCanvas';
 import { formatTimecode, getActiveLyricState } from '../utils/lyricsTiming';
 import { LyricTimingEditor } from './LyricTimingEditor';
@@ -40,11 +40,16 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [timelineTime, setTimelineTime] = useState(0);
+  const [instrumentalBuffer, setInstrumentalBuffer] = useState<AudioBuffer | null>(null);
+  const [isCleaningAudio, setIsCleaningAudio] = useState(false);
 
-  // Audio playback refs
+  // Audio playback refs (dual sample-locked buffers: Original + Clean STFT Instrumental)
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const dspRef = useRef<ReturnType<typeof connectVocalRemovalGraph> | null>(null);
+  const drySourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const wetSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const dryGainRef = useRef<GainNode | null>(null);
+  const wetGainRef = useRef<GainNode | null>(null);
+  const masterGainRef = useRef<GainNode | null>(null);
   const playStartWallRef = useRef<number>(0);
   const playStartTimelineRef = useRef<number>(0);
   const rafRef = useRef<number>(0);
@@ -57,26 +62,61 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
     [project.lines, songTime]
   );
 
-  // Stop active audio node cleanly
+  // Pre-render crystal-clear STFT vocal-removed AudioBuffer whenever source or DSP options change
+  useEffect(() => {
+    let cancelled = false;
+    setIsCleaningAudio(true);
+
+    void renderCleanKaraokeAudioBuffer(audioBuffer, {
+      suppression: 1,
+      bassPreserve: project.vocalRemoval.bassPreserve,
+      extraVocalCut: project.vocalRemoval.extraVocalCut,
+    })
+      .then((clean) => {
+        if (!cancelled) {
+          setInstrumentalBuffer(clean);
+          setIsCleaningAudio(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setIsCleaningAudio(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    audioBuffer,
+    project.vocalRemoval.bassPreserve,
+    project.vocalRemoval.extraVocalCut,
+  ]);
+
+  // Stop active audio nodes cleanly
   const stopAudioEngine = useCallback(() => {
     if (rafRef.current) {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = 0;
     }
-    if (sourceRef.current) {
-      try {
-        sourceRef.current.onended = null;
-        sourceRef.current.stop();
-      } catch {
-        // ignore if already stopped
+    [drySourceRef, wetSourceRef].forEach((ref) => {
+      if (ref.current) {
+        try {
+          ref.current.onended = null;
+          ref.current.stop();
+        } catch {
+          // ignore if already stopped
+        }
+        ref.current.disconnect();
+        ref.current = null;
       }
-      sourceRef.current.disconnect();
-      sourceRef.current = null;
-    }
-    if (dspRef.current) {
-      dspRef.current.disconnect();
-      dspRef.current = null;
-    }
+    });
+    [dryGainRef, wetGainRef, masterGainRef].forEach((ref) => {
+      if (ref.current) {
+        ref.current.disconnect();
+        ref.current = null;
+      }
+    });
   }, []);
 
   // Cleanup on unmount or audioBuffer swap
@@ -90,12 +130,14 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
     };
   }, [audioBuffer, stopAudioEngine]);
 
-  // Live update vocal removal DSP parameters while playing
+  // Zero-distortion linear crossfade between Original and Clean Instrumental while playing
   useEffect(() => {
-    if (dspRef.current) {
-      dspRef.current.updateConfig(project.vocalRemoval);
-    }
-  }, [project.vocalRemoval]);
+    const ctx = audioCtxRef.current;
+    if (!ctx || !dryGainRef.current || !wetGainRef.current) return;
+    const s = Math.max(0, Math.min(1, project.vocalRemoval.suppression));
+    dryGainRef.current.gain.setTargetAtTime(1 - s, ctx.currentTime, 0.02);
+    wetGainRef.current.gain.setTargetAtTime(s, ctx.currentTime, 0.02);
+  }, [project.vocalRemoval.suppression]);
 
   // Render live canvas whenever state or playhead updates
   useEffect(() => {
@@ -150,32 +192,51 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
         try {
           await ctx.resume();
         } catch {
-          // ignore resume rejection if browser requires direct click
+          // ignore resume rejection
         }
       }
 
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
+      const activeWetBuffer =
+        instrumentalBuffer ??
+        (await renderCleanKaraokeAudioBuffer(audioBuffer, {
+          suppression: 1,
+          bassPreserve: project.vocalRemoval.bassPreserve,
+          extraVocalCut: project.vocalRemoval.extraVocalCut,
+        }));
 
-      const dsp = connectVocalRemovalGraph(
-        ctx,
-        source,
-        ctx.destination,
-        project.isStereo,
-        project.vocalRemoval
-      );
+      const masterGain = ctx.createGain();
+      masterGain.gain.value = 0.96;
+      masterGain.connect(ctx.destination);
 
-      sourceRef.current = source;
-      dspRef.current = dsp;
+      const dryGain = ctx.createGain();
+      const wetGain = ctx.createGain();
+      const s = Math.max(0, Math.min(1, project.vocalRemoval.suppression));
+      dryGain.gain.value = 1 - s;
+      wetGain.gain.value = s;
+
+      dryGain.connect(masterGain);
+      wetGain.connect(masterGain);
+
+      const drySource = ctx.createBufferSource();
+      drySource.buffer = audioBuffer;
+      drySource.connect(dryGain);
+
+      const wetSource = ctx.createBufferSource();
+      wetSource.buffer = activeWetBuffer;
+      wetSource.connect(wetGain);
+
+      drySourceRef.current = drySource;
+      wetSourceRef.current = wetSource;
+      dryGainRef.current = dryGain;
+      wetGainRef.current = wetGain;
+      masterGainRef.current = masterGain;
 
       const introDur = project.metadata.introDuration;
-      if (clampedStart < introDur) {
-        const delaySec = introDur - clampedStart;
-        source.start(ctx.currentTime + delaySec, 0);
-      } else {
-        const songOffset = Math.max(0, clampedStart - introDur);
-        source.start(ctx.currentTime, songOffset);
-      }
+      const startWhen = clampedStart < introDur ? ctx.currentTime + (introDur - clampedStart) : ctx.currentTime;
+      const songOffset = clampedStart < introDur ? 0 : Math.max(0, clampedStart - introDur);
+
+      drySource.start(startWhen, songOffset);
+      wetSource.start(startWhen, songOffset);
 
       playStartWallRef.current = performance.now();
       playStartTimelineRef.current = clampedStart;
@@ -200,9 +261,11 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
     [
       audioBuffer,
       ensureAudioContext,
-      project.isStereo,
+      instrumentalBuffer,
       project.metadata.introDuration,
-      project.vocalRemoval,
+      project.vocalRemoval.bassPreserve,
+      project.vocalRemoval.extraVocalCut,
+      project.vocalRemoval.suppression,
       stopAudioEngine,
       totalDuration,
     ]
@@ -392,9 +455,11 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
                   </h2>
                 </div>
                 <p className="mt-0.5 text-xs text-slate-400">
-                  {project.isStereo
-                    ? vocalModeLabel
-                    : 'Traccia mono: filtro attenuazione voce attivo'}
+                  {isCleaningAudio
+                    ? 'Elaborazione spettrale pulita della base in corso...'
+                    : project.isStereo
+                    ? `${vocalModeLabel} · Filtro spettrale ad alta fedeltà`
+                    : 'Traccia mono: attenuazione formanti vocali'}
                 </p>
               </div>
 

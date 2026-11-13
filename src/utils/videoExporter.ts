@@ -5,9 +5,9 @@ import {
   SongMetadata,
   VocalRemovalConfig,
 } from '../types/karaoke';
-import { connectVocalRemovalGraph } from './audioEngine';
 import { renderKaraokeFrame } from './karaokeCanvas';
 import { sanitizeExportFilename } from './lyricsTiming';
+import { renderCleanKaraokeAudioBuffer } from './spectralVocalRemover';
 
 export interface ExportVideoOptions {
   audioBuffer: AudioBuffer;
@@ -48,7 +48,6 @@ export async function exportKaraokeVideo(
 ): Promise<ExportVideoResult> {
   const {
     audioBuffer,
-    isStereo,
     metadata,
     lines,
     style,
@@ -77,6 +76,20 @@ export async function exportKaraokeVideo(
     throw new Error('Impossibile inizializzare il contesto grafico 2D per l\'esportazione.');
   }
 
+  // Pre-render crystal-clear STFT vocal-removed audio before recording starts
+  const s = Math.max(0, Math.min(1, vocalRemoval.suppression));
+  const cleanBuffer =
+    s > 0
+      ? await renderCleanKaraokeAudioBuffer(audioBuffer, {
+          ...vocalRemoval,
+          suppression: 1,
+        })
+      : audioBuffer;
+
+  if (signal.aborted) {
+    throw new DOMException('Esportazione annullata dall\'utente.', 'AbortError');
+  }
+
   // Draw initial frame before starting capture
   renderKaraokeFrame({
     ctx,
@@ -98,10 +111,24 @@ export async function exportKaraokeVideo(
   }
 
   const destination = audioCtx.createMediaStreamDestination();
-  const source = audioCtx.createBufferSource();
-  source.buffer = audioBuffer;
+  const masterGain = audioCtx.createGain();
+  masterGain.gain.value = 0.96;
+  masterGain.connect(destination);
 
-  const dsp = connectVocalRemovalGraph(audioCtx, source, destination, isStereo, vocalRemoval);
+  const dryGain = audioCtx.createGain();
+  const wetGain = audioCtx.createGain();
+  dryGain.gain.value = 1 - s;
+  wetGain.gain.value = s;
+  dryGain.connect(masterGain);
+  wetGain.connect(masterGain);
+
+  const drySource = audioCtx.createBufferSource();
+  drySource.buffer = audioBuffer;
+  drySource.connect(dryGain);
+
+  const wetSource = audioCtx.createBufferSource();
+  wetSource.buffer = cleanBuffer;
+  wetSource.connect(wetGain);
 
   const canvasStream = canvas.captureStream(30);
   const combinedStream = new MediaStream([
@@ -128,12 +155,17 @@ export async function exportKaraokeVideo(
 
     const cleanup = () => {
       if (timerId) window.clearInterval(timerId);
-      try {
-        source.stop();
-      } catch {
-        // already stopped
-      }
-      dsp.disconnect();
+      [drySource, wetSource].forEach((src) => {
+        try {
+          src.stop();
+        } catch {
+          // already stopped
+        }
+        src.disconnect();
+      });
+      dryGain.disconnect();
+      wetGain.disconnect();
+      masterGain.disconnect();
       canvasStream.getTracks().forEach((t) => t.stop());
       destination.stream.getTracks().forEach((t) => t.stop());
       audioCtx.close().catch(() => {});
@@ -173,7 +205,8 @@ export async function exportKaraokeVideo(
     const startAudioTime = audioCtx.currentTime + 0.05;
     const wallStart = performance.now();
 
-    source.start(startAudioTime + introDuration);
+    drySource.start(startAudioTime + introDuration);
+    wetSource.start(startAudioTime + introDuration);
     recorder.start(250);
 
     timerId = window.setInterval(() => {
